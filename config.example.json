@@ -1,0 +1,12 @@
+{
+  "server_url": "https://boxy.example.com",
+  "device_id": "",
+  "display_name": "Складской ПК",
+  "printer_name": "",
+  "polling_interval_seconds": 3.0,
+  "heartbeat_interval_seconds": 20.0,
+  "request_timeout_seconds": 10.0,
+  "max_artifact_bytes": 10485760,
+  "dev_mode": false,
+  "dry_run": true
+}
