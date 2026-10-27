@@ -8,7 +8,7 @@ if (-not (Test-Path -LiteralPath $python)) {
 
 Push-Location $projectRoot
 try {
-    & $python -m pytest
+    & $python -m pytest -p no:cacheprovider --basetemp (Join-Path $projectRoot '.build-test-tmp')
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed; refusing to build.' }
     & $python -m PyInstaller --clean --noconfirm BoxyPrintAgent.spec
     if ($LASTEXITCODE -ne 0) { throw 'PyInstaller build failed.' }

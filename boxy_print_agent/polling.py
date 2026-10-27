@@ -16,7 +16,7 @@ from .config import AgentConfig
 from .device_identity import capabilities, hostname
 from .idempotency import DuplicatePrintAttemptError, PrintLedger
 from .logging_setup import redact_text
-from .models import DeviceHeartbeat, JobState, PollResult, PrintJob
+from .models import ClaimedBatch, DeviceHeartbeat, JobState, PollResult, PrintJob
 from .printer import PrinterBackend, PrinterError
 
 
@@ -82,80 +82,114 @@ class PollingService:
             except ApiClientError as exc:
                 self.logger.warning("heartbeat_failed code=%s", exc.code)
 
-        job = self.client.claim_next(self.config.device_id)
-        if job is None:
+        batch = self.client.claim_next_batch(self.config.device_id)
+        if batch is None:
             return PollResult("NO_JOB")
-        if job.device_id != self.config.device_id:
-            self._safe_status(job, JobState.ERROR, code="DEVICE_MISMATCH", message="Job belongs to another device")
-            return PollResult("ERROR", job.job_id, "Job belongs to another device")
-        return self._process_claimed_job(job)
+        mismatched = next(
+            (job for job in batch.jobs if job.device_id != self.config.device_id),
+            None,
+        )
+        if mismatched is not None:
+            for job in batch.jobs:
+                self._safe_status(job, JobState.ERROR, code="DEVICE_MISMATCH", message="Job belongs to another device")
+            return PollResult("ERROR", mismatched.job_id, "Job belongs to another device")
+        return self._process_claimed_batch(batch)
 
     def _process_claimed_job(self, job: PrintJob) -> PollResult:
-        existing = self.ledger.get(job.job_id, job.print_attempt_token)
-        if existing is not None:
-            detail = f"Existing local attempt state: {existing.state.value}"
-            if existing.state != JobState.ACKNOWLEDGED:
-                self.ledger.mark_review_required(job.job_id, job.print_attempt_token, detail)
-                self._safe_status(job, JobState.REVIEW_REQUIRED, code="AMBIGUOUS_PRIOR_ATTEMPT", message=detail)
-            return PollResult("DUPLICATE_BLOCKED", job.job_id, detail)
+        return self._process_claimed_batch(
+            ClaimedBatch(batch_id=f"job.{job.job_id}", jobs=(job,)),
+        )
 
+    def _process_claimed_batch(self, batch: ClaimedBatch) -> PollResult:
+        first_job = batch.jobs[0]
+        existing = [
+            self.ledger.get(job.job_id, job.print_attempt_token)
+            for job in batch.jobs
+        ]
+        if any(entry is not None for entry in existing):
+            detail = "Batch contains an existing local print attempt"
+            for job, entry in zip(batch.jobs, existing):
+                if entry is not None and entry.state != JobState.ACKNOWLEDGED:
+                    self.ledger.mark_review_required(job.job_id, job.print_attempt_token, detail)
+                self._safe_status(
+                    job,
+                    JobState.REVIEW_REQUIRED,
+                    code="AMBIGUOUS_PRIOR_ATTEMPT",
+                    message=detail,
+                )
+            return PollResult("DUPLICATE_BLOCKED", first_job.job_id, detail)
+
+        pages = []
         try:
-            payload = self.client.download_artifact(job, max_bytes=self.config.max_artifact_bytes)
-            validate_artifact(payload, job.artifact, max_bytes=self.config.max_artifact_bytes)
-            if job.copies != 1:
-                raise ArtifactValidationError("UNSUPPORTED_COPIES", "MVP accepts exactly one copy")
+            for job in batch.jobs:
+                payload = self.client.download_artifact(job, max_bytes=self.config.max_artifact_bytes)
+                validate_artifact(payload, job.artifact, max_bytes=self.config.max_artifact_bytes)
+                if job.copies != 1:
+                    raise ArtifactValidationError("UNSUPPORTED_COPIES", "MVP accepts exactly one copy")
+                pages.append((payload, job.artifact, job.copies))
             self.printer.validate_printer(self.config.printer_name)
         except (ApiClientError, ArtifactValidationError, PrinterError) as exc:
             code = getattr(exc, "code", "PRE_PRINT_ERROR")
             message = redact_text(exc)
-            self._safe_status(job, JobState.ERROR, code=code, message=message)
-            self.logger.error("job_preflight_failed job_id=%s code=%s", job.job_id, code)
-            return PollResult("ERROR", job.job_id, message, code)
+            for job in batch.jobs:
+                self._safe_status(job, JobState.ERROR, code=code, message=message)
+            self.logger.error("batch_preflight_failed batch_id=%s code=%s", batch.batch_id, code)
+            return PollResult("ERROR", first_job.job_id, message, code)
 
         try:
-            self.ledger.record_intent(
-                job_id=job.job_id,
-                attempt_token=job.print_attempt_token,
-                artifact_sha256=job.artifact.sha256,
+            self.ledger.record_batch_intent(
+                [
+                    (job.job_id, job.print_attempt_token, job.artifact.sha256)
+                    for job in batch.jobs
+                ],
                 printer_name=self.config.printer_name,
             )
         except DuplicatePrintAttemptError as exc:
-            return PollResult("DUPLICATE_BLOCKED", job.job_id, str(exc))
+            return PollResult("DUPLICATE_BLOCKED", first_job.job_id, str(exc))
 
+        attempts = [(job.job_id, job.print_attempt_token) for job in batch.jobs]
         try:
-            self.client.update_job_status(job, JobState.PRINT_INTENT)
-            result = self.printer.print_png(
-                payload,
-                job.artifact,
+            for job in batch.jobs:
+                self.client.update_job_status(job, JobState.PRINT_INTENT)
+            result = self.printer.print_png_batch(
+                pages,
                 printer_name=self.config.printer_name,
-                copies=job.copies,
+                document_name=f"Boxy batch {batch.batch_id} ({len(batch.jobs)} labels)",
             )
-            self.ledger.mark_dispatched(job.job_id, job.print_attempt_token, result.spooler_job_id)
-            self.client.update_job_status(
-                job,
-                JobState.DISPATCHED_TO_SPOOLER,
-                spooler_job_id=result.spooler_job_id,
-            )
-            self.client.update_job_status(
-                job,
-                JobState.ACKNOWLEDGED,
-                spooler_job_id=result.spooler_job_id,
-            )
-            self.ledger.mark_acknowledged(job.job_id, job.print_attempt_token)
+            self.ledger.mark_batch_dispatched(attempts, result.spooler_job_id)
+            for job in batch.jobs:
+                self.client.update_job_status(
+                    job,
+                    JobState.DISPATCHED_TO_SPOOLER,
+                    spooler_job_id=result.spooler_job_id,
+                )
+            for job in batch.jobs:
+                self.client.update_job_status(
+                    job,
+                    JobState.ACKNOWLEDGED,
+                    spooler_job_id=result.spooler_job_id,
+                )
+            self.ledger.mark_batch_acknowledged(attempts)
             self.logger.info(
-                "job_dispatched job_id=%s printer=%s spooler_job_id=%s",
-                job.job_id,
+                "batch_dispatched batch_id=%s job_count=%s printer=%s spooler_job_id=%s",
+                batch.batch_id,
+                len(batch.jobs),
                 self.config.printer_name,
                 result.spooler_job_id or "unknown",
             )
-            return PollResult("DISPATCHED_TO_SPOOLER", job.job_id, result.detail)
+            return PollResult(
+                "DISPATCHED_TO_SPOOLER",
+                first_job.job_id,
+                f"{len(batch.jobs)} label(s): {result.detail}",
+            )
         except Exception as exc:
             message = redact_text(exc)
             code = getattr(exc, "code", "AMBIGUOUS_PRINT_FAILURE")
-            self.ledger.mark_review_required(job.job_id, job.print_attempt_token, message)
-            self._safe_status(job, JobState.REVIEW_REQUIRED, code=code, message=message)
-            self.logger.error("job_requires_review job_id=%s code=%s", job.job_id, code)
-            return PollResult("REVIEW_REQUIRED", job.job_id, message, code)
+            self.ledger.mark_batch_review_required(attempts, message)
+            for job in batch.jobs:
+                self._safe_status(job, JobState.REVIEW_REQUIRED, code=code, message=message)
+            self.logger.error("batch_requires_review batch_id=%s code=%s", batch.batch_id, code)
+            return PollResult("REVIEW_REQUIRED", first_job.job_id, message, code)
 
     def _safe_status(
         self,

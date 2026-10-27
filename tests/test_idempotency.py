@@ -43,3 +43,21 @@ def test_restart_preserves_idempotency_state(tmp_path) -> None:
     assert entry.spooler_job_id == "spool-7"
     with pytest.raises(DuplicatePrintAttemptError):
         _record(restarted)
+
+
+def test_batch_intents_and_transitions_are_atomic(tmp_path) -> None:
+    ledger = PrintLedger(tmp_path / "ledger.sqlite3")
+    attempts = [
+        ("job-1", "attempt-1", "a" * 64),
+        ("job-2", "attempt-2", "b" * 64),
+    ]
+
+    ledger.record_batch_intent(attempts, printer_name="Test printer")
+    keys = [(job_id, token) for job_id, token, _ in attempts]
+    ledger.mark_batch_dispatched(keys, "spool-9")
+    ledger.mark_batch_acknowledged(keys)
+
+    assert ledger.get("job-1", "attempt-1").state == JobState.ACKNOWLEDGED
+    assert ledger.get("job-2", "attempt-2").state == JobState.ACKNOWLEDGED
+    assert ledger.get("job-1", "attempt-1").spooler_job_id == "spool-9"
+    assert ledger.get("job-2", "attempt-2").spooler_job_id == "spool-9"

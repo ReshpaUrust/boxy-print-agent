@@ -10,7 +10,7 @@ from typing import Any
 from PIL import Image
 
 from .api_client import ApiClientError
-from .models import ArtifactMetadata, DeviceHeartbeat, JobState, PairingResult, PrintJob
+from .models import ArtifactMetadata, ClaimedBatch, DeviceHeartbeat, JobState, PairingResult, PrintJob
 
 
 class MockBoxyClient:
@@ -54,6 +54,33 @@ class MockBoxyClient:
                     return job
         return None
 
+    def claim_next_batch(self, device_id: str) -> ClaimedBatch | None:
+        with self._lock:
+            first = next(
+                (
+                    job for job in self._jobs
+                    if job.device_id == device_id
+                    and (job.job_id, job.print_attempt_token) not in self._claimed
+                ),
+                None,
+            )
+            if first is None:
+                return None
+            jobs = [first]
+            if first.batch_id:
+                jobs = [
+                    job for job in self._jobs
+                    if job.device_id == device_id
+                    and job.batch_id == first.batch_id
+                    and (job.job_id, job.print_attempt_token) not in self._claimed
+                ]
+            for job in jobs:
+                self._claimed.add((job.job_id, job.print_attempt_token))
+            return ClaimedBatch(
+                batch_id=first.batch_id or f"job.{first.job_id}",
+                jobs=tuple(jobs),
+            )
+
     def download_artifact(self, job: PrintJob, *, max_bytes: int) -> bytes:
         payload = self._artifacts.get(job.job_id)
         if payload is None:
@@ -88,6 +115,7 @@ def create_mock_job(
     job_id: str = "job-123",
     device_id: str = "dev-device-1",
     attempt_token: str = "attempt-1",
+    batch_id: str = "",
 ) -> tuple[PrintJob, bytes]:
     stream = BytesIO()
     Image.new("RGB", (240, 160), "white").save(stream, format="PNG", dpi=(203, 203))
@@ -110,6 +138,7 @@ def create_mock_job(
             print_attempt_token=attempt_token,
             status=JobState.CLAIMED,
             artifact=metadata,
+            batch_id=batch_id,
         ),
         payload,
     )

@@ -62,6 +62,60 @@ def test_pairing_and_atomic_claim_contract(mock_job) -> None:
     assert [request.method for request in requests] == ["POST", "POST"]
 
 
+def test_batch_claim_contract_returns_ordered_jobs(mock_job) -> None:
+    job, _ = mock_job
+    second = type(job)(
+        job_id="job-124",
+        device_id=job.device_id,
+        print_attempt_token="attempt-2",
+        status=job.status,
+        artifact=job.artifact,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/devices/device-1/jobs/claim-next-batch")
+        return httpx.Response(
+            200,
+            json={"batch_id": "b.batch", "jobs": [_job_payload(job), _job_payload(second)]},
+        )
+
+    client = HttpBoxyClient(
+        "https://boxy.example.test",
+        device_token="scoped-token",
+        transport=httpx.MockTransport(handler),
+    )
+    batch = client.claim_next_batch("device-1")
+    client.close()
+
+    assert batch is not None
+    assert batch.batch_id == "b.batch"
+    assert [item.job_id for item in batch.jobs] == ["job-123", "job-124"]
+
+
+def test_batch_claim_falls_back_to_legacy_single_endpoint(mock_job) -> None:
+    job, _ = mock_job
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path.endswith("claim-next-batch"):
+            return httpx.Response(404, json={})
+        return httpx.Response(200, json=_job_payload(job))
+
+    client = HttpBoxyClient(
+        "https://boxy.example.test",
+        device_token="scoped-token",
+        transport=httpx.MockTransport(handler),
+    )
+    batch = client.claim_next_batch("device-1")
+    client.close()
+
+    assert batch is not None
+    assert batch.jobs == (job,)
+    assert paths[0].endswith("claim-next-batch")
+    assert paths[1].endswith("claim-next")
+
+
 def test_status_callback_has_attempt_scoped_idempotency_key(mock_job) -> None:
     job, _ = mock_job
     captured: list[httpx.Request] = []

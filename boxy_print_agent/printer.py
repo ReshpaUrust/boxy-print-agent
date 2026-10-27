@@ -31,6 +31,14 @@ class PrinterBackend(Protocol):
         copies: int,
     ) -> PrintResult: ...
 
+    def print_png_batch(
+        self,
+        pages: list[tuple[bytes, ArtifactMetadata, int]],
+        *,
+        printer_name: str,
+        document_name: str,
+    ) -> PrintResult: ...
+
 
 class DryRunPrinterBackend:
     def __init__(self, printers: list[str] | None = None):
@@ -52,13 +60,34 @@ class DryRunPrinterBackend:
         printer_name: str,
         copies: int,
     ) -> PrintResult:
+        return self.print_png_batch(
+            [(payload, metadata, copies)],
+            printer_name=printer_name,
+            document_name=f"Boxy artifact {metadata.artifact_id}",
+        )
+
+    def print_png_batch(
+        self,
+        pages: list[tuple[bytes, ArtifactMetadata, int]],
+        *,
+        printer_name: str,
+        document_name: str,
+    ) -> PrintResult:
         self.validate_printer(printer_name)
+        if not pages:
+            raise PrinterError("EMPTY_PRINT_BATCH", "Print batch has no pages")
+        for _, metadata, copies in pages:
+            if metadata.content_type != "image/png":
+                raise PrinterError("UNSUPPORTED_ARTIFACT", "Windows MVP supports PNG only")
+            if copies != 1:
+                raise PrinterError("UNSUPPORTED_COPIES", "MVP accepts exactly one copy per print attempt")
         self.calls.append(
             {
-                "byte_size": len(payload),
-                "artifact_id": metadata.artifact_id,
+                "page_count": len(pages),
+                "artifact_ids": [metadata.artifact_id for _, metadata, _ in pages],
+                "byte_size": sum(len(payload) for payload, _, _ in pages),
                 "printer_name": printer_name,
-                "copies": copies,
+                "document_name": document_name,
             }
         )
         return PrintResult(spooler_job_id=f"dry-run-{len(self.calls)}", detail="Dry-run only")
@@ -101,11 +130,22 @@ class WindowsPrinterBackend:
         printer_name: str,
         copies: int,
     ) -> PrintResult:
+        return self.print_png_batch(
+            [(payload, metadata, copies)],
+            printer_name=printer_name,
+            document_name=f"Boxy artifact {metadata.artifact_id}",
+        )
+
+    def print_png_batch(
+        self,
+        pages: list[tuple[bytes, ArtifactMetadata, int]],
+        *,
+        printer_name: str,
+        document_name: str,
+    ) -> PrintResult:
         self.validate_printer(printer_name)
-        if metadata.content_type != "image/png":
-            raise PrinterError("UNSUPPORTED_ARTIFACT", "Windows MVP supports PNG only")
-        if copies != 1:
-            raise PrinterError("UNSUPPORTED_COPIES", "MVP accepts exactly one copy per print attempt")
+        if not pages:
+            raise PrinterError("EMPTY_PRINT_BATCH", "Print batch has no pages")
         win32con, _, win32ui = self._modules()
         dc = win32ui.CreateDC()
         try:
@@ -114,15 +154,24 @@ class WindowsPrinterBackend:
             dpi_y = dc.GetDeviceCaps(win32con.LOGPIXELSY)
             printable_width = dc.GetDeviceCaps(win32con.HORZRES)
             printable_height = dc.GetDeviceCaps(win32con.VERTRES)
-            with Image.open(BytesIO(payload)) as opened:
-                image = opened.convert("RGB")
-            target_width, target_height = _target_pixels(metadata, image.size, dpi_x, dpi_y)
-            if target_width > printable_width or target_height > printable_height:
-                raise PrinterError("ARTIFACT_DOES_NOT_FIT", "Sticker physical size exceeds printable area")
-            job_id = dc.StartDoc(f"Boxy artifact {metadata.artifact_id}")
-            dc.StartPage()
-            ImageWin.Dib(image).draw(dc.GetHandleOutput(), (0, 0, target_width, target_height))
-            dc.EndPage()
+            prepared_pages = []
+            for payload, metadata, copies in pages:
+                if metadata.content_type != "image/png":
+                    raise PrinterError("UNSUPPORTED_ARTIFACT", "Windows MVP supports PNG only")
+                if copies != 1:
+                    raise PrinterError("UNSUPPORTED_COPIES", "MVP accepts exactly one copy per print attempt")
+                with Image.open(BytesIO(payload)) as opened:
+                    image = opened.convert("RGB")
+                    image.load()
+                target_width, target_height = _target_pixels(metadata, image.size, dpi_x, dpi_y)
+                if target_width > printable_width or target_height > printable_height:
+                    raise PrinterError("ARTIFACT_DOES_NOT_FIT", "Sticker physical size exceeds printable area")
+                prepared_pages.append((image, target_width, target_height))
+            job_id = dc.StartDoc(document_name[:240])
+            for image, target_width, target_height in prepared_pages:
+                dc.StartPage()
+                ImageWin.Dib(image).draw(dc.GetHandleOutput(), (0, 0, target_width, target_height))
+                dc.EndPage()
             dc.EndDoc()
             return PrintResult(spooler_job_id=str(job_id) if job_id is not None else None)
         except PrinterError:

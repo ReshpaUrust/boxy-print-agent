@@ -54,6 +54,7 @@ class PrintJob:
     status: JobState
     artifact: ArtifactMetadata
     copies: int = 1
+    batch_id: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PrintJob":
@@ -64,7 +65,21 @@ class PrintJob:
             status=JobState(str(data.get("status", JobState.CLAIMED))),
             artifact=ArtifactMetadata.from_dict(dict(data["artifact"])),
             copies=int(data.get("copies", 1)),
+            batch_id=str(data.get("batch_id", "")),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedBatch:
+    batch_id: str
+    jobs: tuple[PrintJob, ...]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ClaimedBatch":
+        jobs = tuple(PrintJob.from_dict(dict(row)) for row in data["jobs"])
+        if not jobs:
+            raise ValueError("Claimed batch is empty")
+        return cls(batch_id=str(data["batch_id"]), jobs=jobs)
 
 
 @dataclass(frozen=True, slots=True)

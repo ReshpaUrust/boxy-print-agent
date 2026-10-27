@@ -16,6 +16,7 @@ def capabilities(*, dry_run: bool) -> dict[str, object]:
     return {
         "artifact_content_types": ["image/png"],
         "at_most_once_ledger": True,
+        "batch_spooler_document": True,
         "dry_run": dry_run,
         "operating_system": platform.system(),
         "agent_version": __version__,

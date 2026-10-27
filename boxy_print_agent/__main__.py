@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import sys
 import threading
 from pathlib import Path
 
 from .api_client import HttpBoxyClient
+from .autostart import install_autostart, remove_autostart
 from .app import AgentApplication, runtime_paths
 from .config import ConfigStore, default_data_dir
 from .gui import AgentWindow
@@ -29,6 +31,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pair", action="store_true", help="Prompt securely for a one-time pairing code")
     parser.add_argument("--once", action="store_true", help="Process at most one claimed job")
     parser.add_argument("--gui", action="store_true", help="Open the minimal tkinter UI")
+    parser.add_argument("--background", action="store_true", help="Run polling without a visible window")
+    parser.add_argument("--install-autostart", action="store_true", help="Start this executable at Windows sign-in")
+    parser.add_argument("--remove-autostart", action="store_true", help="Remove Windows sign-in autostart")
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -40,7 +45,10 @@ def create_application(args: argparse.Namespace) -> tuple[AgentApplication, dict
         config.server_url = args.server_url
     if args.dev:
         config.dev_mode = True
-    config.dry_run = bool(args.dry_run or not args.real_print)
+    if args.dry_run:
+        config.dry_run = True
+    elif args.real_print:
+        config.dry_run = False
     paths = runtime_paths(args.config)
     token_store = DpapiDeviceTokenStore(paths["token"])
     token = token_store.load()
@@ -66,7 +74,7 @@ def create_application(args: argparse.Namespace) -> tuple[AgentApplication, dict
         if not config.printer_name:
             config.printer_name = printer.list_printers()[0]
     else:
-        printer = WindowsPrinterBackend(real_print_enabled=args.real_print)
+        printer = WindowsPrinterBackend(real_print_enabled=True)
     if args.printer:
         printer.validate_printer(args.printer)
         config.printer_name = args.printer
@@ -88,12 +96,23 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.real_print and args.dry_run:
         raise SystemExit("Choose either --dry-run or --real-print, not both")
+    if args.install_autostart and args.remove_autostart:
+        raise SystemExit("Choose either --install-autostart or --remove-autostart")
+    if args.install_autostart:
+        install_autostart()
+        return 0
+    if args.remove_autostart:
+        remove_autostart()
+        return 0
     application, paths = create_application(args)
     try:
         if args.pair:
             pairing_code = getpass.getpass("One-time Boxy pairing code: ")
             application.pair(pairing_code)
-        if args.gui:
+        default_gui = bool(getattr(sys, "frozen", False)) and not (
+            args.background or args.once or args.pair
+        )
+        if args.gui or default_gui:
             AgentWindow(application, log_dir=paths["logs"]).run()
             return 0
         if args.once:

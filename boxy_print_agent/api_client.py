@@ -9,7 +9,7 @@ import httpx
 
 from .config import validate_server_url
 from .logging_setup import redact_text
-from .models import DeviceHeartbeat, JobState, PairingResult, PrintJob
+from .models import ClaimedBatch, DeviceHeartbeat, JobState, PairingResult, PrintJob
 
 
 class ApiClientError(RuntimeError):
@@ -27,6 +27,8 @@ class BoxyClient(Protocol):
     def heartbeat(self, heartbeat: DeviceHeartbeat) -> None: ...
 
     def claim_next(self, device_id: str) -> PrintJob | None: ...
+
+    def claim_next_batch(self, device_id: str) -> ClaimedBatch | None: ...
 
     def download_artifact(self, job: PrintJob, *, max_bytes: int) -> bytes: ...
 
@@ -121,6 +123,28 @@ class HttpBoxyClient:
             return PrintJob.from_dict(payload)
         except (KeyError, TypeError, ValueError) as exc:
             raise ApiClientError("INVALID_JOB_RESPONSE", "Claimed job response is invalid") from exc
+
+    def claim_next_batch(self, device_id: str) -> ClaimedBatch | None:
+        try:
+            response = self._request(
+                "POST",
+                f"{self.API_PREFIX}/devices/{quote(device_id, safe='')}/jobs/claim-next-batch",
+                json={"device_id": device_id},
+            )
+        except ApiClientError as exc:
+            if exc.code != "HTTP_404":
+                raise
+            legacy_job = self.claim_next(device_id)
+            if legacy_job is None:
+                return None
+            return ClaimedBatch(batch_id=f"job.{legacy_job.job_id}", jobs=(legacy_job,))
+        if response.status_code == 204:
+            return None
+        payload = self._json_from_response(response)
+        try:
+            return ClaimedBatch.from_dict(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ApiClientError("INVALID_BATCH_RESPONSE", "Claimed batch response is invalid") from exc
 
     def download_artifact(self, job: PrintJob, *, max_bytes: int) -> bytes:
         headers = self._authenticated_headers({"Accept": job.artifact.content_type})

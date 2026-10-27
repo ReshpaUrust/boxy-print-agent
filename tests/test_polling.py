@@ -102,7 +102,7 @@ def test_same_job_with_new_attempt_token_is_explicit_reprint(
 
 
 class FailingPrinter(DryRunPrinterBackend):
-    def print_png(self, payload, metadata, *, printer_name, copies):
+    def print_png_batch(self, pages, *, printer_name, document_name):
         self.validate_printer(printer_name)
         raise PrinterError("SPOOLER_ERROR", "simulated spooler failure")
 
@@ -205,3 +205,54 @@ def test_dry_run_never_calls_windows_backend(
     )
     assert service.run_once().outcome == "DISPATCHED_TO_SPOOLER"
     assert len(printer.calls) == 1
+
+
+def test_one_server_batch_becomes_one_spooler_document(
+    tmp_path, agent_config, test_logger
+) -> None:
+    first, first_payload = create_mock_job(
+        job_id="job-1",
+        device_id=agent_config.device_id,
+        attempt_token="attempt-1",
+        batch_id="batch-1",
+    )
+    second, second_payload = create_mock_job(
+        job_id="job-2",
+        device_id=agent_config.device_id,
+        attempt_token="attempt-2",
+        batch_id="batch-1",
+    )
+    client = MockBoxyClient(
+        jobs=[first, second],
+        artifacts={first.job_id: first_payload, second.job_id: second_payload},
+    )
+    printer = DryRunPrinterBackend([agent_config.printer_name])
+    ledger = PrintLedger(tmp_path / "ledger.sqlite3")
+    service = PollingService(
+        config=agent_config,
+        client=client,
+        ledger=ledger,
+        printer=printer,
+        logger=test_logger,
+    )
+
+    result = service.run_once()
+
+    assert result.outcome == "DISPATCHED_TO_SPOOLER"
+    assert len(printer.calls) == 1
+    assert printer.calls[0]["page_count"] == 2
+    assert printer.calls[0]["artifact_ids"] == [
+        first.artifact.artifact_id,
+        second.artifact.artifact_id,
+    ]
+    assert [update["status"] for update in client.status_updates] == [
+        JobState.PRINT_INTENT,
+        JobState.PRINT_INTENT,
+        JobState.DISPATCHED_TO_SPOOLER,
+        JobState.DISPATCHED_TO_SPOOLER,
+        JobState.ACKNOWLEDGED,
+        JobState.ACKNOWLEDGED,
+    ]
+    assert len({update["spooler_job_id"] for update in client.status_updates[2:]}) == 1
+    assert ledger.get(first.job_id, first.print_attempt_token).state == JobState.ACKNOWLEDGED
+    assert ledger.get(second.job_id, second.print_attempt_token).state == JobState.ACKNOWLEDGED
